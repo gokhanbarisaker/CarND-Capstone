@@ -32,3 +32,10 @@ RUN mkdir /capstone
 VOLUME ["/capstone"]
 VOLUME ["/root/.ros/log/"]
 WORKDIR /capstone/ros
+
+# ensure attaching to running docker container will have 
+# ros & development setup for environment variables
+#
+RUN touch /root/.bashrc
+RUN echo "source /opt/ros/kinetic/setup.bash" >> /root/.bashrc
+RUN echo "source /capstone/ros/devel/setup.bash" >> /root/.bashrc
