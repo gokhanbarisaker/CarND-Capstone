@@ -1,13 +1,6 @@
-camera_info:
-  image_width: 800
-  image_height: 600
-stop_line_positions:
-    - [1148.56, 1184.65]
-    - [1559.2, 1158.43]
-    - [2122.14, 1526.79]
-    - [2175.237, 1795.71]
-    - [1493.29, 2947.67]
-    - [821.96, 2905.8]
-    - [161.76, 2303.82]
-    - [351.84, 1574.65]
-is_site: False
+max_detections: 3
+detector_max_frequency: 0.5
+device: "cpu"
+detection_threshold: 0.3
+min_red_light_size: 4
+light_change_history_length: 2

@@ -10,141 +10,165 @@ from light_classification.tl_classifier import TLClassifier
 import tf
 import cv2
 import yaml
+import torch
+import time
+import numpy as np
 
-STATE_COUNT_THRESHOLD = 3
+from transforms import decode_results
+from dla import get_pose_net
+from cls_model import ClassifierNet
 
 class TLDetector(object):
     def __init__(self):
-        rospy.init_node('tl_detector')
+        rospy.loginfo("Initializing TLDetector")
+        self.frame_id = 0
+        self.history = []
+        self.is_red = False
 
-        self.pose = None
-        self.waypoints = None
+        # ROS declarations
+        rospy.init_node('tl_detector', )
+
         self.camera_image = None
-        self.lights = []
-
-        sub1 = rospy.Subscriber('/current_pose', PoseStamped, self.pose_cb)
-        sub2 = rospy.Subscriber('/base_waypoints', Lane, self.waypoints_cb)
-
-        '''
-        /vehicle/traffic_lights provides you with the location of the traffic light in 3D map space and
-        helps you acquire an accurate ground truth data source for the traffic light
-        classifier by sending the current color state of all traffic lights in the
-        simulator. When testing on the vehicle, the color state will not be available. You'll need to
-        rely on the position of the light and the camera image to predict it.
-        '''
-        sub3 = rospy.Subscriber('/vehicle/traffic_lights', TrafficLightArray, self.traffic_cb)
         sub6 = rospy.Subscriber('/image_color', Image, self.image_cb)
 
+        self.upcoming_red_light_pub = rospy.Publisher('/traffic_waypoint', Int32, queue_size=1)
+        self.bridge = CvBridge()
+
+        # Read config
         config_string = rospy.get_param("/traffic_light_config")
         self.config = yaml.load(config_string)
+        self.device = self.config['device']
+        device = torch.device(self.device)
 
-        self.upcoming_red_light_pub = rospy.Publisher('/traffic_waypoint', Int32, queue_size=1)
+        # Detector model
+        self.detector_max_frequency = self.config['detector_max_frequency']
+        self.detection_threshold = self.config['detection_threshold']
+        self.last_time = -1
+        self.skipped_from_last = 0
 
-        self.bridge = CvBridge()
-        self.light_classifier = TLClassifier()
-        self.listener = tf.TransformListener()
+        self.K = self.config['max_detections']
 
-        self.state = TrafficLight.UNKNOWN
-        self.last_state = TrafficLight.UNKNOWN
-        self.last_wp = -1
-        self.state_count = 0
+        rospy.loginfo("Loading detecor model...")
+        self.model = get_pose_net(34, heads={'hm': 1, 'wh': 2}, head_conv=-1).to(self.device)
+        state_dict = torch.load("./data/detector.pth", map_location=device)
+        self.model.load_state_dict(state_dict)
+        self.model = self.model.to(self.device)
+        rospy.loginfo("Loaded detecor model.")
 
+        # Classifier model
+        rospy.loginfo("Loading clasification model...")
+        self.min_red_light_size = self.config['min_red_light_size']
+        self.light_change_history_length = self.config['light_change_history_length']
+        self.cmodel = ClassifierNet()
+        state_dict = torch.load("./data/classifier.pth", map_location=device)
+        self.cmodel.load_state_dict(state_dict)
+        self.cmodel  = self.cmodel.to(self.device)
+        rospy.loginfo("Loaded clasification model.")
+
+        # Run!
         rospy.spin()
 
-    def pose_cb(self, msg):
-        self.pose = msg
-
-    def waypoints_cb(self, waypoints):
-        self.waypoints = waypoints
-
-    def traffic_cb(self, msg):
-        self.lights = msg.lights
-
     def image_cb(self, msg):
-        """Identifies red lights in the incoming camera image and publishes the index
-            of the waypoint closest to the red light's stop line to /traffic_waypoint
-
-        Args:
-            msg (Image): image from car-mounted camera
-
-        """
         self.has_image = True
-        self.camera_image = msg
-        light_wp, state = self.process_traffic_lights()
-
-        '''
-        Publish upcoming red lights at camera frequency.
-        Each predicted state has to occur `STATE_COUNT_THRESHOLD` number
-        of times till we start using it. Otherwise the previous stable state is
-        used.
-        '''
-        if self.state != state:
-            self.state_count = 0
-            self.state = state
-        elif self.state_count >= STATE_COUNT_THRESHOLD:
-            self.last_state = self.state
-            light_wp = light_wp if state == TrafficLight.RED else -1
-            self.last_wp = light_wp
-            self.upcoming_red_light_pub.publish(Int32(light_wp))
+        now = time.time()
+        if 1/(now-self.last_time)<=self.detector_max_frequency:
+            self.skipped_from_last=0
+            self.camera_image = msg
+            self.last_time = now
+            is_red_light, time_ms, detections, clsval = self.is_red_light_visible()
+            rospy.loginfo("Time(ms):"+str(int(time_ms)) + 
+                " Red?:"+str(is_red_light)+
+                " Detections:"+str(detections)+
+                " Classificiations:"+str(clsval))
+            self.frame_id += 1
         else:
-            self.upcoming_red_light_pub.publish(Int32(self.last_wp))
-        self.state_count += 1
+            self.skipped_from_last+=1
 
-    def get_closest_waypoint(self, pose):
-        """Identifies the closest path waypoint to the given position
-            https://en.wikipedia.org/wiki/Closest_pair_of_points_problem
-        Args:
-            pose (Pose): position to match a waypoint to
+    def preapre_tensor(self, cv_image):
+        cv_image = cv2.resize(cv_image, (512,512))
+        resized = cv_image.copy()
+        cv_image = (cv_image / 255.0)
+        cv_image = cv_image.transpose(2,0,1)
 
-        Returns:
-            int: index of the closest waypoint in self.waypoints
+        input = torch.tensor(cv_image, dtype=torch.float).unsqueeze(0)
+        return input, resized
 
-        """
-        #TODO implement
-        return 0
+    def detect(self, input):
+        output = self.model.forward(input)[0]   
+        output_hm = output['hm']
+        output_wh = output['wh']
 
-    def get_light_state(self, light):
-        """Determines the current color of the traffic light
+        # Decode results
+        dets = decode_results(output_hm, output_wh, self.K)[0]
+        return dets
 
-        Args:
-            light (TrafficLight): light to classify
+    def clip(self, val):
+        if val<0:
+            return 0
+        if val>511:
+            return 511
+        return val
 
-        Returns:
-            int: ID of traffic light color (specified in styx_msgs/TrafficLight)
+    def classify(self, input, bbox):
+        x1,y1,x2,y2 = bbox
+        x1,y1,x2,y2 = self.clip(int(4*x1)),self.clip(int(4*y1)),self.clip(int(4*x2)),self.clip(int(4*y2) )
 
-        """
-        if(not self.has_image):
-            self.prev_light_loc = None
+        if x2-x1<=self.min_red_light_size or y2-y1<=self.min_red_light_size:
             return False
 
+        fname = "./data/temp/"+str(self.frame_id)+"_pre.png"
+        cv2.imwrite(fname, input)
+        input = input[y1:y2,x1:x2,:].copy()
+        fname = "./data/temp/"+str(self.frame_id)+".png"
+        cv2.imwrite(fname, input)
+        input_copy = input.copy()
+        input = cv2.resize(input,(32,32))
+
+        input= input - 0.5
+        input = (input / 255.0) - 0.5
+        input = input.transpose(2,0,1)
+        input = torch.tensor(input, dtype=torch.float).unsqueeze(0)
+
+        result = (self.cmodel(input)[0]).cpu().detach().numpy()
+
+        fname = "./data/temp/"+str(self.frame_id)+"_"+str(result[0])+"_"+str(result[1])+".png"
+        result_val = np.exp(result[1])/(np.exp(result[0])+np.exp(result[1]))
+        result = result[0]<=result[1]
+        cv2.imwrite(fname, input_copy)
+
+        return result, result_val
+        
+    def is_red_light_visible(self):
+        if(not self.has_image):
+            return False
+
+        time_a = time.time()
         cv_image = self.bridge.imgmsg_to_cv2(self.camera_image, "bgr8")
 
-        #Get classification
-        return self.light_classifier.get_classification(cv_image)
+        original_shape = cv_image.shape
+        cv_image, cv_resized = self.preapre_tensor(cv_image)
+        detections = self.detect(cv_image)
 
-    def process_traffic_lights(self):
-        """Finds closest visible traffic light, if one exists, and determines its
-            location and color
+        red_lights_colors = [False]
+        scores = detections['scores']
+        bboxes = detections['bboxes']
+        cls_vals = []
+        for di,_ in enumerate(detections):
+            if scores[di] > self.detection_threshold:
+                classification_result, cls_val = self.classify(cv_resized, bboxes[di])
+                red_lights_colors.append(classification_result)
+                cls_vals.append(cls_val)
+        light_state = any(red_lights_colors)
+        self.history.append(light_state)
+        self.history = self.history[-self.light_change_history_length:]
+        
+        if all([h==self.history[-1] for h in self.history]):
+            self.is_red = self.history[-1]
 
-        Returns:
-            int: index of waypoint closes to the upcoming stop line for a traffic light (-1 if none exists)
-            int: ID of traffic light color (specified in styx_msgs/TrafficLight)
+        time_b = time.time()
+        elapsed_ms = 1000.0 * (time_b-time_a)
+        return self.is_red, elapsed_ms, len(detections), cls_vals
 
-        """
-        light = None
-
-        # List of positions that correspond to the line to stop in front of for a given intersection
-        stop_line_positions = self.config['stop_line_positions']
-        if(self.pose):
-            car_position = self.get_closest_waypoint(self.pose.pose)
-
-        #TODO find the closest visible traffic light (if one exists)
-
-        if light:
-            state = self.get_light_state(light)
-            return light_wp, state
-        self.waypoints = None
-        return -1, TrafficLight.UNKNOWN
 
 if __name__ == '__main__':
     try:
