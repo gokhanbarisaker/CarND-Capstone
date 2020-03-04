@@ -1,6 +1,7 @@
 max_detections: 3
-detector_max_frequency: 0.5
+detector_max_frequency: 0.1
 device: "cpu"
 detection_threshold: 0.3
 min_red_light_size: 4
 light_change_history_length: 2
+red_light_threshold: 0.5

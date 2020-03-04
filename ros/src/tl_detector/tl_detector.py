@@ -58,6 +58,7 @@ class TLDetector(object):
         # Classifier model
         rospy.loginfo("Loading clasification model...")
         self.min_red_light_size = self.config['min_red_light_size']
+        self.red_light_threshold = self.config['red_light_threshold']
         self.light_change_history_length = self.config['light_change_history_length']
         self.cmodel = ClassifierNet()
         state_dict = torch.load("./data/classifier.pth", map_location=device)
@@ -69,6 +70,16 @@ class TLDetector(object):
         rospy.spin()
 
     def image_cb(self, msg):
+        """
+            Publishes:
+                -1 when frame skipped
+                0 when no red light detected
+                1 red light detected
+        """
+        RED_LIGHT_VALUE = 1
+        NORED_LIGHT_VALUE = 0
+        SKIPPED_FRAME_VALUE = -1
+
         self.has_image = True
         now = time.time()
         if 1/(now-self.last_time)<=self.detector_max_frequency:
@@ -81,7 +92,12 @@ class TLDetector(object):
                 " Detections:"+str(detections)+
                 " Classificiations:"+str(clsval))
             self.frame_id += 1
+            if is_red_light:
+                self.upcoming_red_light_pub.publish(Int32(RED_LIGHT_VALUE))
+            else:
+                self.upcoming_red_light_pub.publish(Int32(NORED_LIGHT_VALUE))
         else:
+            self.upcoming_red_light_pub.publish(Int32(SKIPPED_FRAME_VALUE))
             self.skipped_from_last+=1
 
     def preapre_tensor(self, cv_image):
@@ -94,7 +110,7 @@ class TLDetector(object):
         return input, resized
 
     def detect(self, input):
-        output = self.model.forward(input)[0]   
+        output = self.model.forward(input.to(self.device))[0]   
         output_hm = output['hm']
         output_wh = output['wh']
 
@@ -114,13 +130,9 @@ class TLDetector(object):
         x1,y1,x2,y2 = self.clip(int(4*x1)),self.clip(int(4*y1)),self.clip(int(4*x2)),self.clip(int(4*y2) )
 
         if x2-x1<=self.min_red_light_size or y2-y1<=self.min_red_light_size:
-            return False
+            return False, 0.0
 
-        fname = "./data/temp/"+str(self.frame_id)+"_pre.png"
-        cv2.imwrite(fname, input)
         input = input[y1:y2,x1:x2,:].copy()
-        fname = "./data/temp/"+str(self.frame_id)+".png"
-        cv2.imwrite(fname, input)
         input_copy = input.copy()
         input = cv2.resize(input,(32,32))
 
@@ -129,18 +141,15 @@ class TLDetector(object):
         input = input.transpose(2,0,1)
         input = torch.tensor(input, dtype=torch.float).unsqueeze(0)
 
-        result = (self.cmodel(input)[0]).cpu().detach().numpy()
-
-        fname = "./data/temp/"+str(self.frame_id)+"_"+str(result[0])+"_"+str(result[1])+".png"
+        result = (self.cmodel(input.to(self.device))[0]).cpu().detach().numpy()
         result_val = np.exp(result[1])/(np.exp(result[0])+np.exp(result[1]))
-        result = result[0]<=result[1]
-        cv2.imwrite(fname, input_copy)
+        result = result_val>self.red_light_threshold
 
         return result, result_val
         
     def is_red_light_visible(self):
         if(not self.has_image):
-            return False
+            return False, 0.0, 0, []
 
         time_a = time.time()
         cv_image = self.bridge.imgmsg_to_cv2(self.camera_image, "bgr8")
