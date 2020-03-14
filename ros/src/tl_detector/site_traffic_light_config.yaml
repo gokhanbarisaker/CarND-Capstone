@@ -1,7 +1,6 @@
-max_detections: 3
-detector_max_frequency: 5
-device: "cuda"
+detector_max_frequency: 8
 detection_threshold: 0.3
+detection_iou: 0.45
 min_red_light_size: 4
-light_change_history_length: 3
+light_change_history_length: 2
 red_light_threshold: 0.5
