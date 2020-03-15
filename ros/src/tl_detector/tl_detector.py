@@ -95,6 +95,10 @@ class TLDetector(object):
         """
 
         self.has_image = True
+
+        if not self.detector and not self.classifier:
+            return
+
         now = time.time()
 
         if 1/(now-self.last_time) <= self.detector_max_frequency:
