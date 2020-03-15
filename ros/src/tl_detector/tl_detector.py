@@ -229,7 +229,7 @@ class TLDetector(object):
                 classification_result, cls_val = self.classify(cv_resized, bboxes[di])
                 red_lights_colors.append(classification_result)
                 cls_vals.append(cls_val)
-        cv2.imwrite('temp.jpg', cv_resized)
+        # cv2.imwrite('temp.jpg', cv_resized)
         light_state = any(red_lights_colors)
         self.history.append(light_state)
         self.history = self.history[-self.light_change_history_length:]
