@@ -4,3 +4,5 @@ detection_iou: 0.45
 min_red_light_size: 4
 light_change_history_length: 2
 red_light_threshold: 0.5
+stop_line_positions:
+    - [8.0, 16.2]
